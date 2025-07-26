@@ -13,6 +13,11 @@ env:
 jobs:
   build-test-push:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      security-events: write
+      actions: read
     strategy:
       matrix:
         container:
@@ -102,21 +107,145 @@ jobs:
 #          name: "SCAP Scan Results - ${{ matrix.container.name }}"
 #          path: ubi-scap-output
 
-      - name: OpenSCAP Scan
-        run: docker build . --file Dockerfile.Openscap --build-arg CONTAINER="localbuild/${{ matrix.container.name }}:${{ env.VERSION }}" --tag "localbuild/${{ matrix.container.name }}-scap"
+      - name: Setup OpenSCAP scanning tools
+        run: |
+          # Use Alpine container with OpenSCAP (GitHub runners don't have libopenscap8)
+          docker run -d --name openscap-scanner \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v $(pwd):/workspace \
+            --workdir /workspace \
+            --privileged \
+            alpine:3.18.3
+          
+          # Install prerequisites in Alpine container
+          docker exec openscap-scanner apk add curl docker openscap-docker npm gcompat unzip jq
+          docker exec openscap-scanner npm install -g "@microsoft/sarif-multitool@4.3.5"
+          docker exec openscap-scanner npm install -g "@mitre/saf@1.2.33"
+          
+          # Download SCAP Security Guide
+          docker exec openscap-scanner mkdir -p ssg
+          docker exec openscap-scanner curl "https://github.com/ComplianceAsCode/content/releases/download/v0.1.69/scap-security-guide-0.1.69.zip" -Lso "ssg/ssg.zip"
+          docker exec openscap-scanner unzip "ssg/ssg.zip" -d "ssg"
 
-      - uses: shrink/actions-docker-extract@v3
-        id: "ubi-extract-openscap"
-        with:
-          image: "localbuild/${{ matrix.container.name }}-scap"
-          path: /tmp/openscap.html
-          destination: ubi-openscap-output
+      - name: Run OpenSCAP Docker Scan
+        run: |
+          set -e
+          IMAGE_NAME="localbuild/${{ matrix.container.name }}:${{ env.VERSION }}"
+          
+          # Extract /etc/os-release to determine the appropriate SCAP profile
+          container_id=$(docker create "${IMAGE_NAME}")
+          if ! docker export "${container_id}" | tar -tvf - | grep -E '\setc/os-release( ->.*)?$' > /dev/null 2>&1 ; then
+            echo "::warning::The operating system used by ${IMAGE_NAME} could not be detected."
+            echo "::warning::This is likely a UBI-based image. Using RHEL 9 profile as default."
+            ssg="scap-security-guide-0.1.69/ssg-rhel9-ds.xml"
+            profile="xccdf_org.ssgproject.content_profile_standard"
+            docker rm "$container_id"
+          else
+            docker cp -L "$container_id:/etc/os-release" .
+            docker rm "$container_id"
+            
+            version_id=$(awk -F= '$1=="VERSION_ID" { print $2 ;}' os-release | sed 's/"//g')
+            id=$(awk -F= '$1=="ID" { print $2 ;}' os-release | sed 's/"//g')
+            
+            echo "::notice::Detected OS: ${id} ${version_id}"
+            
+            if [ "${id}" = "rhel" ] && echo "${version_id}" | grep -qE '^8(\..*)?$' ; then
+              ssg="scap-security-guide-0.1.69/ssg-rhel8-ds.xml"
+            elif [ "${id}" = "rhel" ] && echo "${version_id}" | grep -qE '^9(\..*)?$' ; then
+              ssg="scap-security-guide-0.1.69/ssg-rhel9-ds.xml"
+            elif [ "${id}" = "rhel" ] && echo "${version_id}" | grep -qE '^10(\..*)?$' ; then
+              ssg="scap-security-guide-0.1.69/ssg-rhel10-ds.xml"
+            else
+              echo "::warning::No specific configuration for ${id} ${version_id}, using RHEL 9 as default"
+              ssg="scap-security-guide-0.1.69/ssg-rhel9-ds.xml"
+            fi
+            
+            # Select the best available profile
+            profile=""
+            for p in xccdf_org.ssgproject.content_profile_cis_level2_server xccdf_org.ssgproject.content_profile_cis xccdf_org.ssgproject.content_profile_standard; do
+              if docker exec openscap-scanner oscap info --profiles "ssg/${ssg}" | grep -qF "${p}:"; then
+                profile="${p}"
+                echo "::notice::Selected profile: ${profile}"
+                break
+              fi
+            done
+            
+            if [ -z "${profile}" ]; then
+              echo "::error::No suitable profile found for ${ssg}"
+              exit 1
+            fi
+          fi
+          
+          # Run the OpenSCAP scan against the Docker IMAGE (not container)
+          set +e
+          docker exec openscap-scanner oscap-docker image "${IMAGE_NAME}" xccdf eval \
+            --verbose ERROR \
+            --fetch-remote-resources \
+            --profile "${profile}" \
+            --results "openscap-report-${{ matrix.container.name }}.xml" \
+            --report "openscap-report-${{ matrix.container.name }}.html" \
+            "ssg/${ssg}"
+          OSCAP_EXIT_CODE=$?
+          set -e
+          
+          case "${OSCAP_EXIT_CODE}" in
+            0)
+              echo "::notice::All rules passed for ${{ matrix.container.name }}"
+              ;;
+            1)
+              echo "::error::An error occurred during evaluation for ${{ matrix.container.name }}"
+              exit 2
+              ;;
+            2)
+              echo "::warning::There is at least one rule with either fail or unknown result for ${{ matrix.container.name }}"
+              ;;
+            *)
+              echo "::error::OpenSCAP returned an unexpected exit status of $OSCAP_EXIT_CODE for ${{ matrix.container.name }}"
+              exit "$OSCAP_EXIT_CODE"
+              ;;
+          esac
+
+      - name: Convert OpenSCAP results to SARIF
+        run: |
+          # Convert XCCDF to HDF format
+          docker exec openscap-scanner saf convert xccdf_results2hdf \
+            -i "openscap-report-${{ matrix.container.name }}.xml" \
+            -o "openscap-report-${{ matrix.container.name }}.hdf"
+          
+          # Convert HDF to SARIF format
+          docker exec openscap-scanner bash -c "DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1 sarif-multitool convert -t Hdf -o openscap-report-${{ matrix.container.name }}.sarif openscap-report-${{ matrix.container.name }}.hdf.json"
+          
+          # Filter SARIF results for GitHub Security (remove non-actionable items)
+          docker exec openscap-scanner jq 'del(.runs[].results[] | select(.kind == "notApplicable" or .kind == "pass" or .kind == "informational" ))' "openscap-report-${{ matrix.container.name }}.sarif" > "filtered-${{ matrix.container.name }}.sarif"
+          
+          # Copy results back to host
+          docker cp "openscap-scanner:/workspace/openscap-report-${{ matrix.container.name }}.html" .
+          docker cp "openscap-scanner:/workspace/openscap-report-${{ matrix.container.name }}.xml" .
+          docker cp "openscap-scanner:/workspace/openscap-report-${{ matrix.container.name }}.hdf.json" .
+          docker cp "openscap-scanner:/workspace/filtered-${{ matrix.container.name }}.sarif" .
 
       - name: Upload OpenSCAP Results
         uses: actions/upload-artifact@v4
         with:
           name: "OpenSCAP Scan Results - ${{ matrix.container.name }}"
-          path: ubi-openscap-output
+          path: |
+            openscap-report-${{ matrix.container.name }}.html
+            openscap-report-${{ matrix.container.name }}.xml
+            openscap-report-${{ matrix.container.name }}.hdf.json
+            filtered-${{ matrix.container.name }}.sarif
+
+      - name: Upload OpenSCAP SARIF to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: "filtered-${{ matrix.container.name }}.sarif"
+          category: "openscap-${{ matrix.container.name }}"
+
+      - name: Cleanup OpenSCAP environment
+        if: always()
+        run: |
+          docker stop openscap-scanner || true
+          docker rm openscap-scanner || true
 
       - name: Run Inspec Scan
         run: docker build . --file Dockerfile.inspec --build-arg CONTAINER="localbuild/${{ matrix.container.name }}:${{ env.VERSION }}" --tag "localbuild/${{ matrix.container.name }}-inspec"
